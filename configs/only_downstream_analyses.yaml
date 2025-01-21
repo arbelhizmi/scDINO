@@ -6,7 +6,8 @@ meta:
   test_datasetsplit_fraction: 0.1
   seed: 40 #should match scDINO seed if you want to use the same train/test split
   images_are_RGB: False
-  channel_dict: { 0: "APC", 1: "BF", 2: "DAPI", 3: "GREEN", 4: "PE" } #do not use underscore or slash in channel name
+#  channel_dict: { 0: "APC", 1: "BF", 2: "DAPI", 3: "GREEN", 4: "PE" } #do not use underscore or slash in channel name
+  channel_dict: { 0: "CellBound1", 1: "CellBound2", 2: "CellBound3", 3: "DAPI", 4: "PolyT" } #do not use underscore or slash in channel name
   selected_channel_combination_per_run: ["01234", "0", "1", "2", "3", "4"] #01234 is all 5 channels, 0 is only APC, 1 is only BF, etc.
   center_crop: 0 #0 is no center crop
 compute_cls_features:
@@ -16,7 +17,8 @@ compute_cls_features:
   normalize: True
   parse_mean_std_from_file: True
   mean_std_file_location: "dir/mean_and_std_of_dataset.txt"
-  norm_per_channel: "[(x,x,x,x,x)(x,x,x,x,x)]" #only used if parse_mean_std_from_file is False
+#  norm_per_channel: "[(x,x,x,x,x)(x,x,x,x,x)]" #only used if parse_mean_std_from_file is False
+  norm_per_channel: "[(0.2981, 0.5047, 0.1918, 0.2809, 0.3800), (0.2232, 0.1659, 0.2403, 0.1938, 0.1956)]" #only used if parse_mean_std_from_file is False
   use_cuda: True
   num_gpus: 1
   batch_size_per_gpu: 24

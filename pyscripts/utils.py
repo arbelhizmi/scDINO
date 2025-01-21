@@ -26,6 +26,7 @@ import math
 import random
 import datetime
 import subprocess
+import argparse
 from collections import defaultdict, deque
 
 import numpy as np
@@ -38,6 +39,56 @@ import torchvision.transforms.functional as TF
 import random
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+
+def init_distributed_mode(args):
+    # launched with torch.distributed.launch
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+    # launched with submitit on a slurm cluster
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
+    # launched naively with `python main_dino.py`
+    # we manually add MASTER_ADDR and MASTER_PORT to env variables
+    elif torch.cuda.is_available():
+        print('Will run the code on one GPU.')
+        args.rank, args.gpu, args.world_size = 0, 0, 1
+        os.environ['MASTER_ADDR'] = f'127.0.0.1'
+        os.environ['MASTER_PORT'] = f'{29500 + random.randint(0, 500)}'
+    else:
+        print('Does not support training without GPU.')
+        sys.exit(1)
+
+    dist.init_process_group(
+        backend="nccl" if os.name.lower() != 'nt' else 'gloo',
+        init_method=args.dist_url,
+        world_size=args.world_size,
+        rank=args.rank,
+    )
+
+    torch.cuda.set_device(args.gpu)
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    dist.barrier()
+    setup_for_distributed(args.rank == 0)
 
 
 def collate_fn(batch):
@@ -94,8 +145,12 @@ class normalize_tensor_0_to_1(object):
 
 
 def normalize_numpy_0_to_1(x):
-    x_min = x.min(axis=(0,1), keepdims=True)
-    x_max = x.max(axis=(0,1), keepdims=True)
+    x = x.numpy()
+
+    # x_min = x.min(axis=(0,1), keepdims=True)
+    # x_max = x.max(axis=(0,1), keepdims=True)
+    x_min = x.min(axis=(2,3), keepdims=True)
+    x_max = x.max(axis=(2,3), keepdims=True)
     diff_min_max = x_max - x_min
     if check_nan(diff_min_max):
         print("diff_min_max is nan")
@@ -637,58 +692,58 @@ def save_on_master(*args, **kwargs):
         torch.save(*args, **kwargs)
 
 
-def setup_for_distributed(is_master):
-    """
-    This function disables printing when not in master process
-    """
-    import builtins as __builtin__
-    builtin_print = __builtin__.print
+# def setup_for_distributed(is_master):
+#     """
+#     This function disables printing when not in master process
+#     """
+#     import builtins as __builtin__
+#     builtin_print = __builtin__.print
+#
+#     def print(*args, **kwargs):
+#         force = kwargs.pop('force', False)
+#         if is_master or force:
+#             builtin_print(*args, **kwargs)
+#
+#     __builtin__.print = print
 
-    def print(*args, **kwargs):
-        force = kwargs.pop('force', False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
 
-    __builtin__.print = print
-
-
-def init_distributed_mode(args):
-    # launched with torch.distributed.launch
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
-    # launched with submitit on a slurm cluster
-    elif 'SLURM_PROCID' in os.environ:
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
-    # launched naively with `python main_dino.py`
-    # we manually add MASTER_ADDR and MASTER_PORT to env variables
-    elif torch.cuda.is_available():
-        print('Will run the code on one GPU.')
-        args.rank, args.gpu, args.world_size = 0, 0, 1
-        # os.environ['MASTER_ADDR'] = '127.0.0.1'
-        #define another random adress to avoid address already in use error
-        os.environ['MASTER_ADDR'] = '127.0.0.{}'.format(random.randint(1, 255))
-        # os.environ['MASTER_PORT'] = '29500'
-        os.environ['MASTER_PORT'] = str(random.randint(29500, 30000))
-        print('MASTER_ADDR: {}'.format(os.environ['MASTER_ADDR']))
-    else:
-        print('Does not support training without GPU.')
-        sys.exit(1)
-
-    dist.init_process_group(
-        backend="gloo",
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
-    )
-
-    torch.cuda.set_device(args.gpu)
-    print('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url), flush=True)
-    dist.barrier()
-    setup_for_distributed(args.rank == 0)
+# def init_distributed_mode(args):
+#     # launched with torch.distributed.launch
+#     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+#         args.rank = int(os.environ["RANK"])
+#         args.world_size = int(os.environ['WORLD_SIZE'])
+#         args.gpu = int(os.environ['LOCAL_RANK'])
+#     # launched with submitit on a slurm cluster
+#     elif 'SLURM_PROCID' in os.environ:
+#         args.rank = int(os.environ['SLURM_PROCID'])
+#         args.gpu = args.rank % torch.cuda.device_count()
+#     # launched naively with `python main_dino.py`
+#     # we manually add MASTER_ADDR and MASTER_PORT to env variables
+#     elif torch.cuda.is_available():
+#         print('Will run the code on one GPU.')
+#         args.rank, args.gpu, args.world_size = 0, 0, 1
+#         # os.environ['MASTER_ADDR'] = '127.0.0.1'
+#         #define another random adress to avoid address already in use error
+#         os.environ['MASTER_ADDR'] = '127.0.0.{}'.format(random.randint(1, 255))
+#         # os.environ['MASTER_PORT'] = '29500'
+#         os.environ['MASTER_PORT'] = str(random.randint(29500, 30000))
+#         print('MASTER_ADDR: {}'.format(os.environ['MASTER_ADDR']))
+#     else:
+#         print('Does not support training without GPU.')
+#         sys.exit(1)
+#
+#     dist.init_process_group(
+#         backend="gloo",
+#         init_method=args.dist_url,
+#         world_size=args.world_size,
+#         rank=args.rank,
+#     )
+#
+#     torch.cuda.set_device(args.gpu)
+#     print('| distributed init (rank {}): {}'.format(
+#         args.rank, args.dist_url), flush=True)
+#     dist.barrier()
+#     setup_for_distributed(args.rank == 0)
 
 
 def accuracy(output, target, topk=(1,)):

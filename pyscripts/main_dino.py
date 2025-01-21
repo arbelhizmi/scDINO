@@ -1,12 +1,11 @@
 import argparse
 import os
-from random import shuffle
+import random
 import sys
 import datetime
 import time
 import math
 import json
-from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
@@ -16,19 +15,25 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-from vision_transformer import DINOHead
-import utils
-import vision_transformer as vits
 from tifffile import imread
 import numpy
-from PIL import Image
-import torchvision
 import ast
-from catalyst.data import DistributedSamplerWrapper
+# from catalyst.data import DistributedSamplerWrapper
+import wandb
+
+from pyscripts.dino_utils import DataAugmentationDINO
+from pyscripts.merfish_dataset import MerfishCellCenters
+from vision_transformer import DINOHead
+import utils
+import run_with_waic as waic
+import vision_transformer as vits
+from lightning.fabric import Fabric
+
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
@@ -95,7 +100,7 @@ def get_args_parser():
     parser.add_argument('--optimizer', default='adamw', type=str,
         choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
-    parser.add_argument('--selected_channels', default=[0,1,2], type=list, help="""list of channel indexes of the .tiff images which should be used to create the tensors.""")
+    parser.add_argument('--selected_channels', default=[0,1,2,3,4], type=list, help="""list of channel indexes of the .tiff images which should be used to create the tensors.""")
     parser.add_argument('--norm_per_channel_file', default="path/to/file", type=str, help="""path to mean and std file in json format""")
     parser.add_argument('--upscale_factor', default=0, type=float, help="""upscale factor to upsample images""")
     parser.add_argument('--center_crop', default=0, type=int, help="""center crop factor to crop images""")
@@ -113,61 +118,161 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
+    # parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=5, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=42, type=int, help='Random seed.')
-    parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    # parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument('--num_workers', default=0, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
-    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    # parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--parse_params',help='Load settings from file in json format. Command line options override values in file.')
     parser.add_argument('--train_datasetsplit_fraction', default=0.8, type=float, help='fraction of training dataset to use for training')
     parser.add_argument('--dino_vit_name', default='vit_small_p16', type=str, help='name of ViTs')
     parser.add_argument('--channel_dict', default=None, help="""name of the channels in format as dict channel_number, channel_name.""")
     parser.add_argument('--name_of_run', default='/recent_run', type=str)
     parser.add_argument('--full_ViT_name', default='full_vit_name', type=str, help='name channel combi ViT')
+
+    # Dataset arguments
+    parser.add_argument(
+        '--liver_slices_directory_path', type=str, default='/home/labs/nyosef/jonasm/vizgen',
+        help='path to the liver slices directory (e.g. like ../jonasm/vizgen directory)',
+    )
+    parser.add_argument(
+        '--liver_slice_names', default=['Liver1Slice1', ], type=list, nargs='+',
+        help='list of liver slice names as list of strs (like Liver1Slice1 etc.)',
+    )
+    parser.add_argument(
+        '--transformed_coordinates_csv_path', type=str, default='/home/labs/nyosef/Collaboration/Arbel/vizgen_liver',
+        help='path to the local liver slices directory (e.g. like ../Collaboration/Arbel/vizgen_liver directory)',
+    )
+    parser.add_argument(
+        '--crop_size', type=int, default=36, help='crop size around cell centers in pixels (should be even number)',
+    )
+    parser.add_argument(
+        '--gene_expression_path', type=str, help='path to the gene expression data',
+        default='/home/labs/nyosef/Collaboration/SpatialDatasets/vizgen/mouse_liver/liver-joint-scvi3-annotated.h5ad',
+    )
+
+    # wandb
+    parser.add_argument('--wandb_project', type=str, help='name of wandb project')
+    parser.add_argument('--wandb_id', type=str, help='run id for wandb')
+
+    # must have this arg for run_with_waic
+    parser.add_argument('--output_dir', default='./experiments', type=str, help='path to save logs and checkpoints.')
+
+    # FABRIC ARGS - set by run_with_waic
+    parser.add_argument('--accelerator', default='cuda', type=str)
+    parser.add_argument('--strategy', default='ddp', type=str)
+    parser.add_argument('--precision', default='16-mixed', type=str)
+
     return parser
 
 
-def train_dino(args, save_dir):
-    utils.init_distributed_mode(args)
-    utils.fix_random_seeds(args.seed)
-    print("git:\n  {}\n".format(utils.get_sha()))
-    print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+def train_dino(args):
+# def train_dino(local_rank, args):
+    # utils.init_distributed_mode(args)
+    # utils.fix_random_seeds(args.seed)
+    # print("git:\n  {}\n".format(utils.get_sha()))
+    # print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    # cudnn.benchmark = True
+    # print('saving log file of run parameters')
+    # with open(os.path.join(save_dir, "run_log.txt"), "w") as f:
+    #     f.write(f"successfully computed features with seed {args.seed}: \n")
+    #     f.write("parameters: \n")
+    #     for arg in vars(args):
+    #         f.write(f"{arg} : {getattr(args, arg)} \n")
+
+    # limit number of threads for the main process per GPU
+    # torch.set_num_threads(2)
+    # torch.set_num_interop_threads(2)  # this must be done only once!
+    #
+    # print(f'running main function multiple times {local_rank}: {args}')
+    # os.environ['RANK'] = f'{local_rank}'
+    # os.environ['LOCAL_RANK'] = f'{local_rank}'
+    # # os.environ['MASTER_ADDR'] = 'localhost'
+    # os.environ['MASTER_ADDR'] = '127.0.0.1'
+    # os.environ['MASTER_PORT'] = f'{args.port}'
+    # utils.init_distributed_mode(args)
+    # utils.fix_random_seeds(args.seed)
+    #
+    # print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    # cudnn.benchmark = True
+    # torch.set_float32_matmul_precision('high')
+    # torch.backends.cuda.matmul.allow_tf32 = True
+    # torch.backends.cudnn.allow_tf32 = True
+    #
+    # device = torch.device(f'cuda:{local_rank}')
+
+    num_devices, num_nodes = waic.lsf_get_num_devices_and_num_nodes_for_current_job()
+    assert num_devices == torch.cuda.device_count(), (f'GPU device count for this node is incorrect. '
+                                                      f'Got {num_devices} from LSF '
+                                                      f'and {torch.cuda.device_count()} from PyTorch.')
+    fabric = Fabric(accelerator=args.accelerator, strategy=args.strategy, precision=args.precision,
+                    devices=num_devices, num_nodes=num_nodes)
+    fabric.launch()
+
+    # print will only work on rank 0 process
+    waic.setup_for_distributed(fabric.is_global_zero)
+
     cudnn.benchmark = True
-    print('saving log file of run parameters')
-    with open(os.path.join(save_dir, "run_log.txt"), "w") as f:
-        f.write(f"successfully computed features with seed {args.seed}: \n")
-        f.write("parameters: \n")
-        for arg in vars(args):
-            f.write(f"{arg} : {getattr(args, arg)} \n")
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    torch.cuda.set_device(fabric.device)
+
+    seed = fabric.global_rank  # set different seed for each GPU
+    fabric.seed_everything(seed, workers=True)
+
+    # run wandb only on the main process
+    if fabric.is_global_zero and wandb is not None:
+        try:
+            wandb.init(project=args.wandb_project, id=args.wandb_id, resume=args.wandb_id, dir=args.output_dir)
+            # you might need to add "entity=" argument to the init method.
+            wandb.config.update(args, allow_val_change=True)
+        except Exception as e:
+            print(f'Could not start wandb. got {e}')
+            sys.exit(1)
+
+    # limit number of threads for the main process per GPU -- ask Shai about this
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(2)  # this must be done only once!
 
     # ============ preparing data ... ============
 
-    def load_mean_std_per_channel(norm_per_channel_file):
-        with open(args.norm_per_channel_file) as f:
-            norm_per_channel_json = json.load(f)
-            norm_per_channel = [norm_per_channel_json['mean'], norm_per_channel_json['std']]
-        return norm_per_channel
-
+    # def load_mean_std_per_channel(norm_per_channel_file):
+    #     with open(args.norm_per_channel_file) as f:
+    #         norm_per_channel_json = json.load(f)
+    #         norm_per_channel = [norm_per_channel_json['mean'], norm_per_channel_json['std']]
+    #     return norm_per_channel
+    #
     def create_mean_std_per_channel_for_channel_combi(norm_per_channel_file, selected_channels):
-        norm_per_channel = load_mean_std_per_channel(args.norm_per_channel_file)
+        # norm_per_channel = load_mean_std_per_channel(args.norm_per_channel_file)
+        norm_per_channel = [[0.2981, 0.5047, 0.1918, 0.2809, 0.3800], [0.2232, 0.1659, 0.2403, 0.1938, 0.1956]]
         mean_for_selected_channel, std_for_selected_channel = tuple([norm_per_channel[0][mean] for mean in selected_channels]), tuple([norm_per_channel[1][std] for std in selected_channels])
         return mean_for_selected_channel, std_for_selected_channel
-    
+    #
     selected_channels = list(map(int, args.selected_channels))
     mean_for_selected_channel, std_for_selected_channel = create_mean_std_per_channel_for_channel_combi(args.norm_per_channel_file, selected_channels)
-    
-    transform = DataAugmentationDINO(
-        args.images_are_RGB,
+
+    rgb_images = False
+
+    dino_augmentations = DataAugmentationDINO(
+        # args.images_are_RGB,
+        rgb_images,
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
-        mean_for_selected_channel, 
-        std_for_selected_channel,
     )
 
-    if not args.images_are_RGB:
+    merfish_cell_centers_dataset = MerfishCellCenters(
+        args.liver_slices_directory_path, args.liver_slice_names, args.transformed_coordinates_csv_path,
+        args.crop_size, args.local_crops_number, dino_augmentations,
+    )
+
+    # if not args.images_are_RGB:
+    if not rgb_images:
 
         class Multichannel_dataset(datasets.ImageFolder):
                 def __getitem__(self, idx):
@@ -193,9 +298,11 @@ def train_dino(args, save_dir):
                             target = self.target_transform(target)
                         return image, idx
 
-        dataset_total =  Multichannel_dataset(os.path.join(args.dataset_dir), transform=transform)
+        # dataset_total = Multichannel_dataset(os.path.join(args.dataset_dir), transform=transform)
+        dataset_total = Multichannel_dataset(os.path.join(args.dataset_dir), transform=dino_augmentations)
     else:
-        dataset_total = datasets.ImageFolder(args.dataset_dir, transform=transform)
+        # dataset_total = datasets.ImageFolder(args.dataset_dir, transform=transform)
+        dataset_total = datasets.ImageFolder(args.dataset_dir, transform=dino_augmentations)
 
     #SAMPLER SECTION
     validation_split = float(1-args.train_datasetsplit_fraction)
@@ -214,18 +321,27 @@ def train_dino(args, save_dir):
     print(f"Train dataset consists of {len(train_indices)} images.")
 
     # Creating data samplers and loaders:
-    train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
-    train_sampler_wrapped = DistributedSamplerWrapper(train_sampler)
+    # train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
+    # train_sampler_wrapped = DistributedSamplerWrapper(train_sampler)
+
+    # data_loader = torch.utils.data.DataLoader(
+    #     dataset_total,
+    #     sampler=train_sampler_wrapped,
+    #     batch_size=args.batch_size_per_gpu,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=False,
+    #     shuffle=False,
+    #     collate_fn=utils.collate_fn)
 
     data_loader = torch.utils.data.DataLoader(
-        dataset_total,
-        sampler=train_sampler_wrapped,
+        merfish_cell_centers_dataset,
+        # sampler=train_sampler_wrapped,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
-        shuffle=False, 
-        collate_fn=utils.collate_fn)
+        shuffle=False)
 
     print("Successfully loaded data.")
 
@@ -293,12 +409,8 @@ def train_dino(args, save_dir):
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-    elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
-    elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
+    optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
@@ -324,7 +436,7 @@ def train_dino(args, save_dir):
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     utils.restart_from_checkpoint(
-        os.path.join(save_dir, "checkpoint.pth"),
+        os.path.join(args.output_dir, "checkpoint.pth"),
         run_variables=to_restore,
         student=student,
         teacher=teacher,
@@ -355,14 +467,18 @@ def train_dino(args, save_dir):
         }
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(save_dir, 'checkpoint.pth'))
+        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+        
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(save_dir, f'checkpoint{str(epoch)}.pth'))
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+            
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
+
         if utils.is_main_process():
-            with (Path(save_dir) / "log.txt").open("a") as f:
+            with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -487,102 +603,39 @@ class DINOLoss(nn.Module):
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
-class DataAugmentationDINO(object):
-    def __init__(self,images_are_RGB, global_crops_scale, local_crops_scale, local_crops_number, mean_for_selected_channel,std_for_selected_channel):
-        
-        if not images_are_RGB:
-            flip_gamma_brightness = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.5),
-                #utils.AdjustGamma_custom(0.8),
-                utils.AdjustBrightness(0.8),
-            ])
-            normalize = transforms.Compose([
-                # utils.normalize_0_to_1(),
-                transforms.Normalize(mean_for_selected_channel, std_for_selected_channel),
-            ])
-
-            # first global crop
-            self.global_transfo1 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_gamma_brightness,
-                utils.GaussianBlur_forGreyscaleMultiChan(1.0),
-                normalize,
-            ])
-            # second global crop
-            self.global_transfo2 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_gamma_brightness,
-                utils.GaussianBlur_forGreyscaleMultiChan(0.1),
-                utils.Solarization_forGreyscaleMultiChan(0.2),
-                normalize,
-            ])
-            # transformation for the local small crops
-            self.local_crops_number = local_crops_number
-            self.local_transfo = transforms.Compose([
-                transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_gamma_brightness,
-                utils.GaussianBlur_forGreyscaleMultiChan(0.5),
-                normalize,
-            ])
-
-        #images are RGB
-        else:
-            flip_and_color_jitter = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            ])
-            normalize = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean_for_selected_channel, std_for_selected_channel),
-            ])
-
-            # first global crop
-            self.global_transfo1 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(1.0),
-                normalize,
-            ])
-            # second global crop
-            self.global_transfo2 = transforms.Compose([
-                transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(0.1),
-                utils.Solarization(0.2),
-                normalize,
-            ])
-            # transformation for the local small crops
-            self.local_crops_number = local_crops_number
-            self.local_transfo = transforms.Compose([
-                transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=transforms.InterpolationMode.BICUBIC),
-                flip_and_color_jitter,
-                utils.GaussianBlur(p=0.5),
-                normalize,
-            ])
-
-    def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        for crop in crops:
-            if torch.isnan(crop).any():
-                print("Nan found in the crop")
-        return crops
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
     args = parser.parse_args()
+
+    WANDB_API_KEY = "bf4145762da226d5725d5ff721ed351474665f2a"
+    # avoid poort collision
+    args.port = 56782 + random.randint(0, 1000)
+
+    if wandb is not None:
+        # see: https://github.com/wandb/client/blob/master/docs/dev/wandb-service-user.md
+        wandb.require("service")
+        wandb.setup()
+        wandb.login(key=WANDB_API_KEY)
+
+    train_dino(args)
+
+    # # do not spawn if world size is 1 or less
+    # if torch.cuda.device_count() <= 1:
+    #     train_dino(
+    #         torch.cuda.current_device(), args=args,
+    #     )
+    # else:
+    #     # ready to spawn
+    #     os.environ['WORLD_SIZE'] = f'{torch.cuda.device_count()}'
+    #     torch.multiprocessing.spawn(
+    #         train_dino, nprocs=torch.cuda.device_count(),
+    #         args=(args,),
+    #     )
+
     if args.parse_params:
         t_args = argparse.Namespace()
         t_args.__dict__.update(ast.literal_eval(args.parse_params))
         args = parser.parse_args(namespace=t_args)
-    save_dir = f"{args.output_dir}/{args.name_of_run}/scDINO_ViTs/{args.full_ViT_name}"
-    Path(save_dir).mkdir(parents=True, exist_ok=True)
-    train_dino(args, save_dir)
+    # save_dir = f"{args.output_dir}/{args.name_of_run}/scDINO_ViTs/{args.full_ViT_name}"
+    # Path(save_dir).mkdir(parents=True, exist_ok=True)
+    # train_dino(local_rank, args)
